@@ -40,3 +40,5 @@ Example:
 
 starts a canoo between mysql on port 3306 on localhost, dumping the tables `items,issues,reserves`
 and then starts listening for live events on said tables.
+
+Also starts a HTTP listener on port 8080 for a simple API to lookup items.
