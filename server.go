@@ -4,10 +4,11 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
-	"github.com/boltdb/bolt"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/boltdb/bolt"
 )
 
 var errNotFound = errors.New("not found")
@@ -39,6 +40,8 @@ func (s server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case "list":
 		s.list(bktItem)
+	case "stats":
+		s.stats(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -54,6 +57,29 @@ func (s server) list(bucket []byte) {
 		}
 		return nil
 	})
+}
+
+type stats struct {
+	NumItems   int
+	NumBiblios int
+}
+
+func (s server) stats(w http.ResponseWriter, r *http.Request) error {
+	st := &stats{}
+	s.db.View(func(tx *bolt.Tx) error {
+		fmt.Printf("%#v", tx.Bucket(bktItem).Stats())
+		st.NumItems = tx.Bucket(bktItem).Stats().KeyN
+		return nil
+	})
+
+	json, _ := encodeStats(st)
+
+	w.Header().Add("Content-Type", "application/json")
+	if _, err := w.Write(json); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return err
+	}
+	return nil
 }
 
 func (s server) getItem(itemnumber int, w http.ResponseWriter, r *http.Request) error {

@@ -1,16 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/boltdb/bolt"
-	"github.com/siddontang/go-mysql/canal"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/boltdb/bolt"
+	"github.com/siddontang/go-mysql/canal"
 )
 
 var host = flag.String("host", "127.0.0.1", "MySQL host")
@@ -29,11 +31,12 @@ var dbs = flag.String("dbs", "test", "dump databases, seperated by comma")
 var tables = flag.String("tables", "", "dump tables, seperated by comma, will overwrite dbs")
 var tableDB = flag.String("table_db", "test", "database for dump tables")
 var ignoreTables = flag.String("ignore_tables", "", "ignore tables, must be database.table format, separated by comma")
+var httpAddr = flag.String("http", ":8009", "HTTP serve address")
 
 var (
 	bktMeta   = []byte("meta")
 	bktItem   = []byte("item")
-	bktRecord = []byte("record")
+	bktBiblio = []byte("biblio")
 )
 
 type Main struct {
@@ -76,18 +79,21 @@ func main() {
 	m.db = db
 
 	// Setup required buckets
-	if err := m.setup(); err != nil {
+	if err := m.setupBuckets(); err != nil {
 		log.Fatal(err)
 	}
 
 	// Register a handler to handle RowsEvent
 	m.canal.RegRowsEventHandler(&rowsEventHandler{m})
 
-	log.Println("Starting canal...")
-	go m.run()
+	//log.Println("Starting canal...")
+	//go m.runCanal()
 
-	log.Printf("Starting HTTP server listening at %v", ":8080")
-	http.ListenAndServe(":8080", newServer(m.db))
+	// TODO: update biblios
+	//m.updateBiblios()
+
+	log.Printf("Starting HTTP server listening at %v", *httpAddr)
+	http.ListenAndServe(*httpAddr, newServer(m.db))
 
 }
 
@@ -112,7 +118,7 @@ func (m Main) newCanal() *canal.Canal {
 	return c
 }
 
-func (m Main) run() {
+func (m Main) runCanal() {
 
 	err := m.canal.Start()
 	if err != nil {
@@ -127,7 +133,7 @@ func (m Main) run() {
 }
 
 // setup ensures DB is set up with required buckets.
-func (m Main) setup() error {
+func (m Main) setupBuckets() error {
 	err := m.db.Update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{bktMeta, bktItem} {
 			_, err := tx.CreateBucketIfNotExists(b)
@@ -140,13 +146,40 @@ func (m Main) setup() error {
 	return err
 }
 
+func (m Main) updateBiblios() error {
+	err := m.db.Update(func(tx *bolt.Tx) error {
+		cur := tx.Bucket(bktItem).Cursor()
+		for k, v := cur.First(); k != nil; k, v = cur.Next() {
+			it := &item{}
+			err := json.Unmarshal(v, &it)
+			if err != nil {
+				return err
+			}
+			b := &biblio{}
+			b.Biblionumber = it.Biblionumber
+
+			data, err := json.Marshal(b)
+			if err != nil {
+				return err
+			}
+			if err := tx.Bucket(bktBiblio).Put(i64tob(b.Biblionumber), data); err != nil {
+				return err
+			}
+			continue
+		}
+		return nil
+	})
+
+	return err
+}
+
 // Eventhandler is a
 type rowsEventHandler struct {
 	m *Main
 }
 
 // Main struct
-type record struct {
+type biblio struct {
 	Biblionumber                      int64 // required
 	Items, Issues, Renewals, Reserves uint32
 	Title                             string
@@ -181,13 +214,13 @@ func (r *rowsEventHandler) Do(e *canal.RowsEvent) error {
 		}
 	case "reserves":
 		// TODO: UPDATE found == T|W -> unavailable, DELETE cancellationdate -> available
-		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	case "issues":
 		// TODO: INSERT -> unavailable
-		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	case "old_issues":
 		// TODO: INSERT returndate -> available
-		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	}
 
 	return nil
@@ -223,11 +256,11 @@ func (r *rowsEventHandler) newItem(rs [][]interface{}) *item {
 // inserts a new item
 func (r *rowsEventHandler) insertItem(i *item) error {
 	err := r.m.db.Update(func(tx *bolt.Tx) error {
-		json, err := encode(i)
+		data, err := encodeItem(i)
 		if err != nil {
 			return err
 		}
-		if err := tx.Bucket(bktItem).Put(i64tob(i.Itemnumber), json); err != nil {
+		if err := tx.Bucket(bktItem).Put(i64tob(i.Itemnumber), data); err != nil {
 			return err
 		}
 		return nil
@@ -258,11 +291,15 @@ func (r *rowsEventHandler) itemAvailable(v []interface{}) bool {
 }
 
 // Utility functions
-func encode(i *item) ([]byte, error) {
+func encodeItem(i *item) ([]byte, error) {
 	return json.Marshal(i)
 }
 
-func decode(b []byte) (item, error) {
+func encodeStats(s *stats) ([]byte, error) {
+	return json.Marshal(s)
+}
+
+func decodeItem(b []byte) (item, error) {
 	var i item
 	err := json.Unmarshal(b, &i)
 	return i, err
@@ -272,6 +309,12 @@ func i64tob(i int64) []byte {
 	b := make([]byte, 8)
 	binary.PutVarint(b, i)
 	return b
+}
+
+func itob(i int) []byte {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, i)
+	return buf.Bytes()
 }
 
 func btoi64(b []byte) (int64, int) {
