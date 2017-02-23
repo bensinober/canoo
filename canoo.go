@@ -6,13 +6,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/boltdb/bolt"
-	"github.com/siddontang/go-mysql/canal"
 	"log"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/boltdb/bolt"
+	"github.com/siddontang/go-mysql/canal"
 )
 
 var host = flag.String("host", "127.0.0.1", "MySQL host")
@@ -89,11 +90,14 @@ func main() {
 	log.Println("Starting canal...")
 	go m.runCanal()
 
-	// TODO: update biblios
-	go m.updateBiblios()
-
 	log.Printf("Starting HTTP server listening at %v", *httpAddr)
 	http.ListenAndServe(*httpAddr, newServer(m.db))
+
+	// wait for dump to be processed before doing anything on biblios
+	<-m.canal.WaitDumpDone()
+
+	// TODO: update biblios
+	go m.updateBiblios()
 
 }
 
@@ -245,41 +249,58 @@ func (r *rowsEventHandler) Do(e *canal.RowsEvent) error {
 		}
 	case "reserves":
 		// TODO: UPDATE found == T|W -> unavailable, DELETE cancellationdate -> available
-		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	case "issues":
 		// TODO: INSERT -> unavailable
-		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	case "old_issues":
 		// TODO: INSERT returndate -> available
-		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	}
 
 	return nil
 }
 
+func ensureInt64(v interface{}) int64 {
+	switch v.(type) {
+	case int:
+		return int64(v.(int))
+	case int8:
+		return int64(v.(int8))
+	case int16:
+		return int64(v.(int16))
+	case int32:
+		return int64(v.(int32))
+	case int64:
+		return v.(int64)
+	default:
+		return v.(int64)
+	}
+}
+
 // creates an item struct from item row event
 func (r *rowsEventHandler) newItem(rs [][]interface{}) *item {
 	i := &item{}
-	for _, v := range rs {
-		i.Itemnumber = v[0].(int64)
-		i.Biblionumber = v[1].(int64)
-		i.Biblioitemnumber = v[2].(int64)
-		if _, ok := v[6].(string); ok {
-			i.Homebranch = v[6].(string)
+	for _, vs := range rs {
+		i.Itemnumber = ensureInt64(vs[0])
+		i.Biblionumber = ensureInt64(vs[1])
+		i.Biblioitemnumber = ensureInt64(vs[2])
+		if _, ok := vs[6].(string); ok {
+			i.Homebranch = vs[6].(string)
 		}
-		if _, ok := v[3].(string); ok {
-			i.Barcode = v[3].(string)
+		if _, ok := vs[3].(string); ok {
+			i.Barcode = vs[3].(string)
 		}
-		if _, ok := v[21].(int64); ok {
-			i.Issues = v[21].(int64)
+		if _, ok := vs[21].(int64); ok {
+			i.Issues = vs[21].(int64)
 		}
-		if _, ok := v[22].(int64); ok {
-			i.Issues = v[22].(int64)
+		if _, ok := vs[22].(int64); ok {
+			i.Issues = vs[22].(int64)
 		}
-		if _, ok := v[23].(int64); ok {
-			i.Reserves = v[23].(int64)
+		if _, ok := vs[23].(int64); ok {
+			i.Reserves = vs[23].(int64)
 		}
-		i.Available = r.itemAvailable(v)
+		i.Available = r.itemAvailable(vs)
 	}
 	return i
 }
@@ -304,16 +325,16 @@ func (r *rowsEventHandler) insertItem(i *item) error {
 // item availability based on row values
 func (r *rowsEventHandler) itemAvailable(v []interface{}) bool {
 
-	if v[13].(int64) != 0 { // notforloan
+	if ensureInt64(v[13]) != 0 { // notforloan
 		return false
 	}
-	if v[14].(int64) != 0 { // damaged
+	if ensureInt64(v[14]) != 0 { // damaged
 		return false
 	}
-	if v[15].(int64) != 0 { // itemlost
+	if ensureInt64(v[15]) != 0 { // itemlost
 		return false
 	}
-	if v[17].(int64) != 0 { // withdrawn
+	if ensureInt64(v[17]) != 0 { // withdrawn
 		return false
 	}
 	if _, ok := v[32].(string); ok == true { // onloan a string?
