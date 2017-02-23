@@ -38,6 +38,16 @@ func (s server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+	case "biblio":
+		b, err := strconv.Atoi(path[2])
+		if err != nil {
+			http.Error(w, "biblionumber must be an integer", http.StatusBadRequest)
+			return
+		}
+		if err := s.getBiblio(b, w, r); err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 	case "list":
 		s.list(bktItem)
 	case "stats":
@@ -67,8 +77,9 @@ type stats struct {
 func (s server) stats(w http.ResponseWriter, r *http.Request) error {
 	st := &stats{}
 	s.db.View(func(tx *bolt.Tx) error {
-		fmt.Printf("%#v", tx.Bucket(bktItem).Stats())
+		//fmt.Printf("%#v", tx.Bucket(bktItem).Stats())
 		st.NumItems = tx.Bucket(bktItem).Stats().KeyN
+		st.NumBiblios = tx.Bucket(bktBiblio).Stats().KeyN
 		return nil
 	})
 
@@ -87,6 +98,32 @@ func (s server) getItem(itemnumber int, w http.ResponseWriter, r *http.Request) 
 	var recJson []byte
 	if err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bktItem).Get(i64tob(int64(itemnumber)))
+		if b == nil {
+			return errNotFound
+		}
+		recJson = make([]byte, len(b))
+		copy(recJson, b)
+		return nil
+	}); err != nil {
+		return err
+	}
+	w.Header().Add("Content-Type", "application/json")
+	w.Header().Set("Content-Encoding", "gzip")
+
+	gz := gzip.NewWriter(w)
+	defer gz.Close()
+	if _, err := gz.Write(recJson); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return err
+	}
+	return nil
+}
+
+func (s server) getBiblio(biblionumber int, w http.ResponseWriter, r *http.Request) error {
+
+	var recJson []byte
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bktBiblio).Get(i64tob(int64(biblionumber)))
 		if b == nil {
 			return errNotFound
 		}

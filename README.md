@@ -33,6 +33,8 @@ Usage of ./canoo:
         database for dump tables (default "test")
     -tables string
         dump tables, seperated by comma, will overwrite dbs
+    -http string
+        TCP port to listen on for simple API (default ":8009")
 
 Example:
 

@@ -6,13 +6,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/boltdb/bolt"
+	"github.com/siddontang/go-mysql/canal"
 	"log"
 	"net/http"
 	"os"
 	"strings"
-
-	"github.com/boltdb/bolt"
-	"github.com/siddontang/go-mysql/canal"
 )
 
 var host = flag.String("host", "127.0.0.1", "MySQL host")
@@ -86,11 +85,11 @@ func main() {
 	// Register a handler to handle RowsEvent
 	m.canal.RegRowsEventHandler(&rowsEventHandler{m})
 
-	//log.Println("Starting canal...")
-	//go m.runCanal()
+	log.Println("Starting canal...")
+	go m.runCanal()
 
 	// TODO: update biblios
-	//m.updateBiblios()
+	go m.updateBiblios()
 
 	log.Printf("Starting HTTP server listening at %v", *httpAddr)
 	http.ListenAndServe(*httpAddr, newServer(m.db))
@@ -135,7 +134,7 @@ func (m Main) runCanal() {
 // setup ensures DB is set up with required buckets.
 func (m Main) setupBuckets() error {
 	err := m.db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bktMeta, bktItem} {
+		for _, b := range [][]byte{bktMeta, bktItem, bktBiblio} {
 			_, err := tx.CreateBucketIfNotExists(b)
 			if err != nil {
 				return err
@@ -146,17 +145,28 @@ func (m Main) setupBuckets() error {
 	return err
 }
 
+// iterate items and aggregate into biblio bucket
 func (m Main) updateBiblios() error {
 	err := m.db.Update(func(tx *bolt.Tx) error {
 		cur := tx.Bucket(bktItem).Cursor()
 		for k, v := cur.First(); k != nil; k, v = cur.Next() {
 			it := &item{}
-			err := json.Unmarshal(v, &it)
-			if err != nil {
+			if err := json.Unmarshal(v, &it); err != nil {
 				return err
 			}
-			b := &biblio{}
-			b.Biblionumber = it.Biblionumber
+			var b *biblio
+			// Biblio alreay exist?
+			oldBib := tx.Bucket(bktBiblio).Get(i64tob(it.Biblionumber))
+			if oldBib != nil {
+				err := json.Unmarshal(oldBib, &b)
+				if err != nil {
+					fmt.Printf("Error decoding bib: %s", err)
+					return err
+				}
+			} else {
+				b = new(biblio)
+			}
+			b.updateBib(it)
 
 			data, err := json.Marshal(b)
 			if err != nil {
@@ -173,6 +183,23 @@ func (m Main) updateBiblios() error {
 	return err
 }
 
+// append to existing biblio or make new
+func (b *biblio) updateBib(it *item) {
+	b.Biblionumber = it.Biblionumber
+	b.Items++
+	b.Issues += it.Issues
+	b.Renewals += it.Renewals
+	b.Reserves += it.Reserves
+	if it.Available == true {
+		if _, ok := b.Availability[it.Homebranch]; ok {
+			b.Availability[it.Homebranch]++
+		} else {
+			b.Availability = make(map[string]int64)
+			b.Availability[it.Homebranch]++
+		}
+	}
+}
+
 // Eventhandler is a
 type rowsEventHandler struct {
 	m *Main
@@ -181,9 +208,9 @@ type rowsEventHandler struct {
 // Main struct
 type biblio struct {
 	Biblionumber                      int64 // required
-	Items, Issues, Renewals, Reserves uint32
+	Items, Issues, Renewals, Reserves int64
 	Title                             string
-	Availability                      []string
+	Availability                      map[string]int64
 }
 
 // item is the items table in koha
