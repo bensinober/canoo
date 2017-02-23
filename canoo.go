@@ -6,14 +6,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/boltdb/bolt"
+	"github.com/siddontang/go-mysql/canal"
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
-
-	"github.com/boltdb/bolt"
-	"github.com/siddontang/go-mysql/canal"
 )
 
 var host = flag.String("host", "127.0.0.1", "MySQL host")
@@ -46,6 +46,7 @@ type Main struct {
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	flag.Parse()
 
 	m := new(Main)
@@ -124,15 +125,15 @@ func (m Main) newCanal() *canal.Canal {
 
 func (m Main) runCanal() {
 
+	sc := make(chan os.Signal, 1)
+
 	err := m.canal.Start()
 	if err != nil {
 		log.Printf("start canal err %v", err)
 		os.Exit(1)
 	}
 
-	sc := make(chan os.Signal, 1)
 	<-sc
-
 	m.canal.Close()
 }
 
