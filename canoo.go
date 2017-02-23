@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 var host = flag.String("host", "127.0.0.1", "MySQL host")
@@ -111,7 +112,7 @@ func (m Main) newCanal() *canal.Canal {
 
 	c, err := canal.NewCanal(cfg)
 	if err != nil {
-		fmt.Printf("create canal err %v", err)
+		log.Printf("create canal err %v", err)
 		os.Exit(1)
 	}
 	return c
@@ -121,7 +122,7 @@ func (m Main) runCanal() {
 
 	err := m.canal.Start()
 	if err != nil {
-		fmt.Printf("start canal err %v", err)
+		log.Printf("start canal err %v", err)
 		os.Exit(1)
 	}
 
@@ -147,6 +148,7 @@ func (m Main) setupBuckets() error {
 
 // iterate items and aggregate into biblio bucket
 func (m Main) updateBiblios() error {
+	start := time.Now()
 	err := m.db.Update(func(tx *bolt.Tx) error {
 		cur := tx.Bucket(bktItem).Cursor()
 		for k, v := cur.First(); k != nil; k, v = cur.Next() {
@@ -160,7 +162,7 @@ func (m Main) updateBiblios() error {
 			if oldBib != nil {
 				err := json.Unmarshal(oldBib, &b)
 				if err != nil {
-					fmt.Printf("Error decoding bib: %s", err)
+					log.Printf("Error decoding bib: %s", err)
 					return err
 				}
 			} else {
@@ -173,13 +175,15 @@ func (m Main) updateBiblios() error {
 				return err
 			}
 			if err := tx.Bucket(bktBiblio).Put(i64tob(b.Biblionumber), data); err != nil {
+				log.Printf("Error updating biblio %d: %s", it.Biblionumber, err)
 				return err
 			}
 			continue
 		}
 		return nil
 	})
-
+	elapsed := time.Since(start)
+	log.Printf("Time updating biblios: %s", elapsed)
 	return err
 }
 
@@ -288,6 +292,7 @@ func (r *rowsEventHandler) insertItem(i *item) error {
 			return err
 		}
 		if err := tx.Bucket(bktItem).Put(i64tob(i.Itemnumber), data); err != nil {
+			fmt.Printf("Error inserting item %d: %s", i.Itemnumber, err)
 			return err
 		}
 		return nil
