@@ -272,7 +272,7 @@ func (r *rowsEventHandler) newItem(itms [][]interface{}) item {
 		}
 		i.Available = r.itemAvailable(vs)
 	}
-	m.ct["processedItems"].Inc(1)
+	r.m.ct["processedItems"].Inc(1)
 	return i
 }
 
