@@ -6,15 +6,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/boltdb/bolt"
-	"github.com/siddontang/go-mysql/canal"
 	"log"
 	"net/http"
 	"os"
 	"runtime"
 	"strings"
-	"sync/atomic"
 	"time"
+
+	"github.com/boltdb/bolt"
+	metrics "github.com/rcrowley/go-metrics"
+	"github.com/siddontang/go-mysql/canal"
 )
 
 var host = flag.String("host", "127.0.0.1", "MySQL host")
@@ -45,7 +46,8 @@ type Main struct {
 	db    *bolt.DB
 	canal *canal.Canal
 
-	itmCnt uint64
+	ct map[string]metrics.Counter
+
 	itmIns chan item
 }
 
@@ -151,6 +153,7 @@ func (m Main) updateBiblios() error {
 				log.Printf("Error updating biblio %d: %s", it.Biblionumber, err)
 				return err
 			}
+			m.ct["savedBiblios"].Inc(1)
 			continue
 		}
 		return nil
@@ -184,24 +187,45 @@ func (r *rowsEventHandler) String() string {
 
 // handler for Rows events
 func (r *rowsEventHandler) Do(e *canal.RowsEvent) error {
+	r.m.ct["numEvents"].Inc(1)
 	switch e.Table.Name {
 	case "items":
 		switch e.Action {
 		case "insert":
+			r.m.ct["itemInsert"].Inc(1)
 			i := r.newItem(e.Rows)
 			r.m.itmIns <- i
 		case "update":
+			r.m.ct["itemUpdate"].Inc(1)
 			// TODO: UPDATE items
 		}
 	case "reserves":
 		// TODO: UPDATE found == T|W -> unavailable, DELETE cancellationdate -> available
 		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		switch e.Action {
+		case "insert":
+			r.m.ct["reserveInsert"].Inc(1)
+		case "update":
+			r.m.ct["reserveUpdate"].Inc(1)
+		}
 	case "issues":
 		// TODO: INSERT -> unavailable
 		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		switch e.Action {
+		case "insert":
+			r.m.ct["issueInsert"].Inc(1)
+		case "update":
+			r.m.ct["issueUpdate"].Inc(1)
+		}
 	case "old_issues":
 		// TODO: INSERT returndate -> available
 		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		switch e.Action {
+		case "insert":
+			r.m.ct["oldIssueInsert"].Inc(1)
+		case "update":
+			r.m.ct["oldIssueUpdate"].Inc(1)
+		}
 	}
 
 	return nil
@@ -248,14 +272,31 @@ func (r *rowsEventHandler) newItem(itms [][]interface{}) item {
 		}
 		i.Available = r.itemAvailable(vs)
 	}
+	m.ct["processedItems"].Inc(1)
 	return i
 }
 
-// inserts a new item
+// collects items into slice to be saved
 func (m Main) runUpdater() {
-	m.itmCnt = 0
-	for i := range m.itmIns {
-		err := m.db.Update(func(tx *bolt.Tx) error {
+	items := make([]item, 1000) // bucket of 1000
+	for it := range m.itmIns {
+		if len(items) == 1000 {
+			//for _, i := range items {
+			m.saveItems(items)
+			//fmt.Printf("%d ", x.Itemnumber)
+			//}
+			items = nil
+		} else {
+			items = append(items, it)
+		}
+
+	}
+	close(m.itmIns)
+
+}
+func (m Main) saveItems(it []item) error {
+	err := m.db.Update(func(tx *bolt.Tx) error {
+		for _, i := range it {
 			data, err := encodeItem(&i)
 			if err != nil {
 				return err
@@ -264,15 +305,10 @@ func (m Main) runUpdater() {
 				fmt.Printf("Error inserting item %d: %s", i.Itemnumber, err)
 				return err
 			}
-			return nil
-		})
-		if err != nil {
-			log.Fatalf("runUpdater ends with err: %s", err)
 		}
-		atomic.AddUint64(&m.itmCnt, 1)
-	}
-	close(m.itmIns)
-
+		return nil
+	})
+	return err
 }
 
 // item availability based on row values
@@ -303,6 +339,21 @@ func main() {
 	m := new(Main)
 	m.canal = m.newCanal()
 	m.itmIns = make(chan item)
+	m.ct = make(map[string]metrics.Counter)
+
+	// metrics
+	m.ct["numEvents"] = metrics.GetOrRegisterCounter("numEvents", nil)
+	m.ct["processedItems"] = metrics.GetOrRegisterCounter("processedItems", nil)
+	m.ct["savedBiblios"] = metrics.GetOrRegisterCounter("savedBiblios", nil)
+	m.ct["itemInsert"] = metrics.GetOrRegisterCounter("itemInsert", nil)
+	m.ct["itemUpdate"] = metrics.GetOrRegisterCounter("itemUpdate", nil)
+	m.ct["reserveInsert"] = metrics.GetOrRegisterCounter("reserveInsert", nil)
+	m.ct["reserveUpdate"] = metrics.GetOrRegisterCounter("reserveUpdate", nil)
+	m.ct["issueInsert"] = metrics.GetOrRegisterCounter("issueInsert", nil)
+	m.ct["issueUpdate"] = metrics.GetOrRegisterCounter("issueUpdate", nil)
+	m.ct["oldIssueInsert"] = metrics.GetOrRegisterCounter("oldIssueInsert", nil)
+	m.ct["oldIssueUpdate"] = metrics.GetOrRegisterCounter("oldIssueUpdate", nil)
+
 	// tables to be ignored
 	if len(*ignoreTables) == 0 {
 		subs := strings.Split(*ignoreTables, ",")
@@ -338,6 +389,8 @@ func main() {
 
 	// Register a handler to handle RowsEvent
 	m.canal.RegRowsEventHandler(&rowsEventHandler{m})
+
+	go metrics.Log(metrics.DefaultRegistry, time.Duration(300)*time.Second, log.New(os.Stderr, "", 0))
 
 	log.Println("Starting canal...")
 	go m.runCanal()
