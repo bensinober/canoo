@@ -13,6 +13,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,63 +44,31 @@ var (
 type Main struct {
 	db    *bolt.DB
 	canal *canal.Canal
+
+	itmCnt uint64
+	itmIns chan item
 }
 
-func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	flag.Parse()
+// Eventhandler - channels for items
+type rowsEventHandler struct {
+	m *Main
+}
 
-	m := new(Main)
-	m.canal = m.newCanal()
+// Biblio struct for JSON bucket bktBiblio
+type biblio struct {
+	Biblionumber                      int64 // required
+	Items, Issues, Renewals, Reserves int64
+	Title                             string
+	Availability                      map[string]int64
+}
 
-	// tables to be ignored
-	if len(*ignoreTables) == 0 {
-		subs := strings.Split(*ignoreTables, ",")
-		for _, sub := range subs {
-			if seps := strings.Split(sub, "."); len(seps) == 2 {
-				m.canal.AddDumpIgnoreTables(seps[0], seps[1])
-			}
-		}
-	}
-
-	// tables to be dumped
-	if len(*tables) > 0 && len(*tableDB) > 0 {
-		subs := strings.Split(*tables, ",")
-		m.canal.AddDumpTables(*tableDB, subs...)
-	} else if len(*dbs) > 0 {
-		subs := strings.Split(*dbs, ",")
-		m.canal.AddDumpDatabases(subs...)
-	}
-
-	// DB setup
-	db, err := bolt.Open("bolt.db", 0640, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	m.db = db
-
-	// Setup required buckets
-	if err := m.setupBuckets(); err != nil {
-		log.Fatal(err)
-	}
-
-	// Register a handler to handle RowsEvent
-	m.canal.RegRowsEventHandler(&rowsEventHandler{m})
-
-	log.Println("Starting canal...")
-	go m.runCanal()
-
-	log.Printf("Starting HTTP server listening at %v", *httpAddr)
-	http.ListenAndServe(*httpAddr, newServer(m.db))
-
-	// wait for dump to be processed before doing anything on biblios
-	<-m.canal.WaitDumpDone()
-
-	// TODO: update biblios
-	go m.updateBiblios()
-
+// item JSON bucket bktItem
+type item struct {
+	Itemnumber, Biblionumber, Biblioitemnumber int64 // required
+	Homebranch                                 string
+	Barcode                                    string
+	Issues, Renewals, Reserves                 int64
+	Available                                  bool
 }
 
 func (m Main) newCanal() *canal.Canal {
@@ -132,7 +101,6 @@ func (m Main) runCanal() {
 		log.Printf("start canal err %v", err)
 		os.Exit(1)
 	}
-
 	<-sc
 	m.canal.Close()
 }
@@ -209,28 +177,7 @@ func (b *biblio) updateBib(it *item) {
 	}
 }
 
-// Eventhandler is a
-type rowsEventHandler struct {
-	m *Main
-}
-
-// Main struct
-type biblio struct {
-	Biblionumber                      int64 // required
-	Items, Issues, Renewals, Reserves int64
-	Title                             string
-	Availability                      map[string]int64
-}
-
-// item is the items table in koha
-type item struct {
-	Itemnumber, Biblionumber, Biblioitemnumber int64 // required
-	Homebranch                                 string
-	Barcode                                    string
-	Issues, Renewals, Reserves                 int64
-	Available                                  bool
-}
-
+// Event handler
 func (r *rowsEventHandler) String() string {
 	return "RowsEventHandler"
 }
@@ -239,24 +186,22 @@ func (r *rowsEventHandler) String() string {
 func (r *rowsEventHandler) Do(e *canal.RowsEvent) error {
 	switch e.Table.Name {
 	case "items":
-		i := r.newItem(e.Rows)
 		switch e.Action {
 		case "insert":
-			if err := r.insertItem(i); err != nil {
-				return err
-			}
+			i := r.newItem(e.Rows)
+			r.m.itmIns <- i
 		case "update":
 			// TODO: UPDATE items
 		}
 	case "reserves":
 		// TODO: UPDATE found == T|W -> unavailable, DELETE cancellationdate -> available
-		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	case "issues":
 		// TODO: INSERT -> unavailable
-		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	case "old_issues":
 		// TODO: INSERT returndate -> available
-		fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
+		//fmt.Printf("%s %s: %#v\n", e.Action, e.Table.Name, e.Rows)
 	}
 
 	return nil
@@ -280,9 +225,9 @@ func ensureInt64(v interface{}) int64 {
 }
 
 // creates an item struct from item row event
-func (r *rowsEventHandler) newItem(rs [][]interface{}) *item {
-	i := &item{}
-	for _, vs := range rs {
+func (r *rowsEventHandler) newItem(itms [][]interface{}) item {
+	var i item
+	for _, vs := range itms {
 		i.Itemnumber = ensureInt64(vs[0])
 		i.Biblionumber = ensureInt64(vs[1])
 		i.Biblioitemnumber = ensureInt64(vs[2])
@@ -307,20 +252,27 @@ func (r *rowsEventHandler) newItem(rs [][]interface{}) *item {
 }
 
 // inserts a new item
-func (r *rowsEventHandler) insertItem(i *item) error {
-	err := r.m.db.Update(func(tx *bolt.Tx) error {
-		data, err := encodeItem(i)
+func (m Main) runUpdater() {
+	m.itmCnt = 0
+	for i := range m.itmIns {
+		err := m.db.Update(func(tx *bolt.Tx) error {
+			data, err := encodeItem(&i)
+			if err != nil {
+				return err
+			}
+			if err := tx.Bucket(bktItem).Put(i64tob(i.Itemnumber), data); err != nil {
+				fmt.Printf("Error inserting item %d: %s", i.Itemnumber, err)
+				return err
+			}
+			return nil
+		})
 		if err != nil {
-			return err
+			log.Fatalf("runUpdater ends with err: %s", err)
 		}
-		if err := tx.Bucket(bktItem).Put(i64tob(i.Itemnumber), data); err != nil {
-			fmt.Printf("Error inserting item %d: %s", i.Itemnumber, err)
-			return err
-		}
-		return nil
-	})
+		atomic.AddUint64(&m.itmCnt, 1)
+	}
+	close(m.itmIns)
 
-	return err
 }
 
 // item availability based on row values
@@ -344,7 +296,68 @@ func (r *rowsEventHandler) itemAvailable(v []interface{}) bool {
 	return true
 }
 
-// Utility functions
+func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	flag.Parse()
+
+	m := new(Main)
+	m.canal = m.newCanal()
+	m.itmIns = make(chan item)
+	// tables to be ignored
+	if len(*ignoreTables) == 0 {
+		subs := strings.Split(*ignoreTables, ",")
+		for _, sub := range subs {
+			if seps := strings.Split(sub, "."); len(seps) == 2 {
+				m.canal.AddDumpIgnoreTables(seps[0], seps[1])
+			}
+		}
+	}
+
+	// tables to be dumped
+	if len(*tables) > 0 && len(*tableDB) > 0 {
+		subs := strings.Split(*tables, ",")
+		m.canal.AddDumpTables(*tableDB, subs...)
+	} else if len(*dbs) > 0 {
+		subs := strings.Split(*dbs, ",")
+		m.canal.AddDumpDatabases(subs...)
+	}
+
+	// DB setup
+	db, err := bolt.Open("bolt.db", 0640, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	m.db = db
+
+	// Setup required buckets
+	if err := m.setupBuckets(); err != nil {
+		log.Fatal(err)
+	}
+
+	// Register a handler to handle RowsEvent
+	m.canal.RegRowsEventHandler(&rowsEventHandler{m})
+
+	log.Println("Starting canal...")
+	go m.runCanal()
+
+	log.Println("Initiating DB updater...")
+	go m.runUpdater()
+
+	// wait for dump to be processed before doing anything further
+	<-m.canal.WaitDumpDone()
+
+	// TODO: update biblios
+	log.Println("Updating biblios...")
+	go m.updateBiblios()
+
+	log.Printf("Starting HTTP server listening at %v", *httpAddr)
+	http.ListenAndServe(*httpAddr, newServer(m.db))
+
+}
+
+/* UTILITY FUNCTIONS */
 func encodeItem(i *item) ([]byte, error) {
 	return json.Marshal(i)
 }
